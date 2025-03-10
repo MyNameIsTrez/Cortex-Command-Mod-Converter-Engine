@@ -1465,6 +1465,7 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                 if (copyOfNameOptional) |nameWithPossibleModulePrefix| {
                     if (indexOf(u8, nameWithPossibleModulePrefix, "/")) |modulePrefixEnd| {
                         moduleName = nameWithPossibleModulePrefix[0..modulePrefixEnd];
+                        copyOfNameOptional = nameWithPossibleModulePrefix[modulePrefixEnd + 1 ..];
                     }
                 }
 
@@ -2472,15 +2473,15 @@ fn writeAstRecursively(node: *Node, buffered_writer: anytype, depth: usize) !voi
     if (node.property) |property| {
         try writeBuffered(buffered_writer, property);
 
-        // Named properties with values, and newline (for empty lines in multilinetext) require the equality symbol
-        if (node.value != null or strEql(property, "NewLine")) {
+        // Named properties with values, and AddLine (for empty lines in MultiLineText), require the equality symbol.
+        if (node.value != null or strEql(property, "AddLine")) {
             try writeBuffered(buffered_writer, " = ");
         }
     }
 
     if (node.value) |value| {
-        try writeBuffered(buffered_writer, value);
-    }
+            try writeBuffered(buffered_writer, value);
+        }
 
     if (node.comments.items.len > 0) {
         if (node.property != null) {
