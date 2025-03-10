@@ -1,0 +1,19 @@
+[
+	"GibParticle",
+	"EmittedParticle",
+	"DeliveryCraft",
+	"AddCargoItem",
+	"Particle",
+	"Shell",
+	"DebrisMaterial",
+	"TargetMaterial",
+	"FrostingMaterial",
+	"TargetMaterial",
+	"Material",
+	"BreakWound",
+	"ParentBreakWound",
+	"RegularRound",
+	"TracerRound",
+	"EntryWound",
+	"ExitWound"
+]

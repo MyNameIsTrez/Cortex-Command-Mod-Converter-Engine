@@ -20,6 +20,7 @@ const bufferedReader = std.io.bufferedReader;
 const bufferedWriter = std.io.bufferedWriter;
 const copyFileAbsolute = std.fs.copyFileAbsolute;
 const endsWith = std.mem.endsWith;
+const indexOf = std.mem.indexOf;
 const eql = std.mem.eql;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const extension = std.fs.path.extension;
@@ -172,6 +173,10 @@ pub fn main() !void {
             std.log.info("Error: Invalid output path", .{});
             return err;
         },
+        error.InvalidRulesPath => {
+            std.log.info("Error: Invalid rules path", .{});
+            return err;
+        },
         error.UnexpectedToken => {
             std.log.info("Error: Unexpected '{s}' at {s}:{}:{}\n", .{
                 diagnostics.token orelse "null",
@@ -216,7 +221,7 @@ pub fn convert(input_folder_path_: []const u8, output_folder_path_: []const u8, 
     // https://github.com/ziglang/zig/issues/15607#issue-1698930560
     if (!try isValidDirPath(input_folder_path_)) return error.InvalidInputPath;
     if (!try isValidDirPath(output_folder_path_)) return error.InvalidOutputPath;
-    if (!try isValidDirPath(rules_folder_path_)) return error.InvalidOutputPath;
+    if (!try isValidDirPath(rules_folder_path_)) return error.InvalidRulesPath;
 
     const input_folder_path = try std.fs.realpathAlloc(allocator, input_folder_path_);
     const output_folder_path = try std.fs.realpathAlloc(allocator, output_folder_path_);
@@ -284,6 +289,10 @@ pub fn convert(input_folder_path_: []const u8, output_folder_path_: []const u8, 
     const ini_sound_container_rules = try parseIniSoundContainerRules(rules_folder_path, allocator);
     std.log.info("Applying INI SoundContainer rules...\n", .{});
     applyIniSoundContainerRules(ini_sound_container_rules, &file_tree);
+
+    const ini_deinlining_rules = try parseIniDeinliningRules(rules_folder_path, allocator);
+    std.log.info("Applying INI de-inlining rules...\n", .{});
+    try applyIniDeinliningRules(allocator, ini_deinlining_rules, &file_tree);
 
     std.log.info("Updating INI file tree...\n", .{});
     try updateIniFileTree(&file_tree, allocator);
@@ -1384,6 +1393,141 @@ fn applyIniSoundContainerRulesRecursivelyNode(node: *Node, property: []const u8)
     }
 }
 
+fn parseIniDeinliningRules(rules_folder_path: []const u8, allocator: Allocator) ![][]const u8 {
+    const ini_deinlining_rules_path = try join(allocator, &.{ rules_folder_path, "ini_deinlining_rules.json" });
+    const text = try readFile(ini_deinlining_rules_path, allocator);
+    return try parseFromSliceLeaky([][]const u8, allocator, text, .{});
+}
+
+fn applyIniDeinliningRules(allocator: Allocator, ini_deinlining_rules: [][]const u8, file_tree: *IniFolder) !void {
+    for (ini_deinlining_rules) |property| {
+        try applyIniDeinliningRulesRecursivelyFolder(allocator, file_tree, property);
+    }
+}
+
+fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *IniFolder, property: []const u8) !void {
+    for (file_tree.folders.items) |*folder| {
+        try applyIniDeinliningRulesRecursivelyFolder(allocator, folder, property);
+    }
+
+    for (file_tree.files.items) |*file| {
+        // This is kind of hideous. Loop through each item in the list.
+        var i: usize = 0;
+        while (i < file.ast.items.len) {
+            const node: *Node = &file.ast.items[i];
+            i = i + 1;
+
+            // Instead of looping over all nodes, loop over the children of each node.
+            // Why necessary? Because some unused inis use the word "Particle" as a root property.
+            for (node.children.items) |*child| {
+                // Deinlining a definition into the file will push the current object further forward.
+                const insertionApplied: bool = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, node.*);
+
+                // We want to read the object again, since we stopped after the deinline, but we also want to read the definition that was deinlined.
+                // So decrement i.
+                if (insertionApplied) {
+                    i = i - 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, property: []const u8, file: *IniFile, rootParent: Node) !bool {
+    // If this has a property, and:
+    if (node.property) |node_property| {
+        // If it matches the property given, and:
+        if (strEql(node_property, property)) {
+            // If this node has children, then:
+            if (node.children.items.len > 0) {
+                // This is a currently inlined constant reference, so:
+
+                // Find if this is a copy and the name of it's copy reference, and if this is a preset and it's preset name.
+                var copyOfNameOptional: ?[]const u8 = null;
+                var presetNameOptional: ?[]const u8 = null;
+
+                for (node.children.items) |*child| {
+                    if (child.property) |child_property| {
+                        if (strEql(child_property, "CopyOf")) {
+                            copyOfNameOptional = child.value;
+                        } else if (strEql(child_property, "PresetName")) {
+                            presetNameOptional = child.value;
+                        }
+                    }
+                }
+
+                // Class name is given, module name is assumed, and probably wrong, but might be conveniently specified already.
+                const className = node.value orelse "None";
+                var moduleName: []const u8 = "Base.rte";
+
+                // Find out if it's conveniently specified.
+                if (copyOfNameOptional) |nameWithPossibleModulePrefix| {
+                    if (indexOf(u8, nameWithPossibleModulePrefix, "/")) |modulePrefixEnd| {
+                        moduleName = nameWithPossibleModulePrefix[0..modulePrefixEnd];
+                    }
+                }
+
+                // Assume that nothing is invalidated.
+                var invalidationFlag = false;
+                if (presetNameOptional) |presetName| {
+                    if (!strEql(rootParent.property.?, "AddLoadout")) {
+                        const duplicateNode = Node{
+                            .property = "AddEffect",
+                            .value = node.value,
+                            .comments = try node.comments.clone(),
+                            .children = try node.children.clone(),
+                        };
+
+                        const determinedIndex = index_of(Node, file.ast.items, rootParent) orelse 0;
+                        try file.ast.insert(determinedIndex, duplicateNode);
+
+                        invalidationFlag = true;
+                    }
+
+                    node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, presetName });
+                } else if (copyOfNameOptional) |copyOfName| {
+                    node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, copyOfName });
+                } else {
+                    node.value = "None";
+                }
+
+                // If comments or children are needed, they belong to the duplicate, in it's definition.
+                node.children.clearRetainingCapacity();
+                node.comments.clearRetainingCapacity();
+
+                // This was, in any case, a constant reference, it shouldn't have children, not here.
+                // Return, and clarify to caller whether we had to deinline anything.
+                return invalidationFlag;
+            }
+        }
+    }
+
+    // Since this isn't a malformed constant reference, check the same for this' children.
+    for (node.children.items) |*child| {
+        const sequenceInvalidated = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, rootParent);
+
+        // We have discovered an inline definition, and corrected it, which we must immediately signal to the caller.
+        if (sequenceInvalidated) {
+            return true;
+        }
+    }
+
+    // This is not a malformed constant reference, neither does it contain any.
+    return false;
+}
+
+// Stolen off stack exchange, surprised the std library hasn't been updated to remedy the specific problem solved by this
+fn index_of(comptime T: type, slice: []const T, value: T) ?usize {
+    for (slice, 0..) |element, index| {
+        if (std.meta.eql(value, element)) {
+            return index;
+        }
+    } else {
+        return null;
+    }
+}
+
 fn updateIniFileTree(file_tree: *IniFolder, allocator: Allocator) !void {
     try applyOnNodesAlloc(addGetsHitByMosWhenHeldToShields, file_tree, allocator);
     try applyOnNodesAlloc(addGripStrength, file_tree, allocator);
@@ -2327,10 +2471,14 @@ fn writeAstRecursively(node: *Node, buffered_writer: anytype, depth: usize) !voi
 
     if (node.property) |property| {
         try writeBuffered(buffered_writer, property);
+
+        // Named properties with values, and newline (for empty lines in multilinetext) require the equality symbol
+        if (node.value != null or strEql(property, "NewLine")) {
+            try writeBuffered(buffered_writer, " = ");
+        }
     }
 
     if (node.value) |value| {
-        try writeBuffered(buffered_writer, " = ");
         try writeBuffered(buffered_writer, value);
     }
 
