@@ -1510,45 +1510,45 @@ fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *In
 }
 
 fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, property: []const u8, file: *IniFile, rootParent: Node, moduleSpace: *ModuleSpace) !bool {
-    // If this has a property, and:
-    if (node.property) |node_property| {
-        // If it matches the property given, and:
-        if (strEql(node_property, property)) {
-            // If this node has children, then:
-            if (node.children.items.len > 0) {
-                // This is a currently inlined constant reference, so:
+    if (node.property) |nodeProperty| {
+        if (node.value) |nodeValue| {
+            if (strEql(nodeProperty, property)) {
+                if (node.children.items.len > 0) {
+                    const className: []const u8 = nodeValue;
+                    var moduleName: []const u8 = "Base.rte";
+                    var presetNameOptional: ?[]const u8 = null;
 
-                // Find if this is a copy and the name of it's copy reference, and if this is a preset and it's preset name.
-                var copyOfNameOptional: ?[]const u8 = null;
-                var presetNameOptional: ?[]const u8 = null;
+                    var isOriginalPreset: bool = false;
+                    var isCopyOf: bool = false;
 
-                for (node.children.items) |*child| {
-                    if (child.property) |child_property| {
-                        if (strEql(child_property, "CopyOf")) {
-                            copyOfNameOptional = child.value;
-                        } else if (strEql(child_property, "PresetName")) {
-                            presetNameOptional = child.value;
+                    // If we read a CopyOf, then whatever preset name we were going with is invalidated.
+                    for (node.children.items) |*child| {
+                        if (child.property) |childProperty| {
+                            const readingCopyOf: bool = strEql(childProperty, "CopyOf");
+                            const readingOriginalPreset: bool = strEql(childProperty, "PresetName");
+                            isCopyOf = isCopyOf or readingCopyOf;
+                            isOriginalPreset = !readingCopyOf and (isOriginalPreset or readingOriginalPreset);
+
+                            if (readingCopyOf or readingOriginalPreset) {
+                                presetNameOptional = child.value;
+                            }
                         }
                     }
-                }
 
-                // Class name is given, module name is assumed, and probably wrong, but might be conveniently specified already.
-                const className = node.value orelse "None";
-                var moduleName: []const u8 = "Base.rte";
-
-                // Find out if it's conveniently specified.
-                if (copyOfNameOptional) |nameWithPossibleModulePrefix| {
-                    if (indexOf(u8, nameWithPossibleModulePrefix, "/")) |modulePrefixEnd| {
-                        moduleName = nameWithPossibleModulePrefix[0..modulePrefixEnd];
-                        copyOfNameOptional = nameWithPossibleModulePrefix[modulePrefixEnd + 1 ..];
+                    // Sometimes both CopyOfs and PresetNames list the module name with the preset name, detect this.
+                    // This lets it respect when well written mods intentionally reference non-Base data entities.
+                    if (presetNameOptional) |presetName| {
+                        if (indexOf(u8, presetName, "/")) |modulePrefixEnd| {
+                            moduleName = presetName[0..modulePrefixEnd];
+                            presetNameOptional = presetName[modulePrefixEnd + 1 ..];
+                        }
                     }
-                }
 
-                // Assume that nothing is invalidated.
-                var invalidationFlag = false;
-                if (presetNameOptional) |presetName| {
-                    // Special case Loadouts
-                    if (!strEql(rootParent.property.?, "AddLoadout")) {
+                    // If this is an original preset, unless it's in a loadout, where all sorts of things seem to go wrong,
+                    // then we're going to deinline it.
+                    const deinliningFlag = isOriginalPreset and !strEql(rootParent.property.?, "AddLoadout");
+
+                    if (deinliningFlag) {
                         moduleName = moduleSpace.moduleName;
 
                         const duplicateNode = Node{
@@ -1560,36 +1560,29 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
 
                         const determinedIndex = index_of(Node, file.ast.items, rootParent) orelse 0;
                         try file.ast.insert(determinedIndex, duplicateNode);
+                    }
 
-                        invalidationFlag = true;
-                    } else {
-                        if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
-                            if (presetNameSpace.get(presetName) != null) {
-                                moduleName = moduleSpace.moduleName;
+                    if (presetNameOptional) |presetName| {
+                        // If this was copied from something, and it isn't an original preset,
+                        // then check if it is pointing to something within this module.
+                        if (isCopyOf and !isOriginalPreset) {
+                            if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
+                                if (presetNameSpace.get(presetName) != null) {
+                                    moduleName = moduleSpace.moduleName;
+                                }
                             }
                         }
+
+                        node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, presetName });
+                    } else {
+                        node.value = "None";
                     }
 
-                    node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, presetName });
-                } else if (copyOfNameOptional) |copyOfName| {
-                    if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
-                        if (presetNameSpace.get(copyOfName) != null) {
-                            moduleName = moduleSpace.moduleName;
-                        }
-                    }
+                    node.children.clearRetainingCapacity();
+                    node.comments.clearRetainingCapacity();
 
-                    node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, copyOfName });
-                } else {
-                    node.value = "None";
+                    return deinliningFlag;
                 }
-
-                // If comments or children are needed, they belong to the duplicate, in it's definition.
-                node.children.clearRetainingCapacity();
-                node.comments.clearRetainingCapacity();
-
-                // This was, in any case, a constant reference, it shouldn't have children, not here.
-                // Return, and clarify to caller whether we had to deinline anything.
-                return invalidationFlag;
             }
         }
     }
