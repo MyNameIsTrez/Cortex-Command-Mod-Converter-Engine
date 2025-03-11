@@ -9,7 +9,7 @@ const page_allocator = std.heap.page_allocator;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
-const HashMap = std.hash_map.HashMap;
+const StringArrayHashMap = std.StringArrayHashMap;
 const MultiArrayList = std.MultiArrayList;
 const Scanner = std.json.Scanner;
 const StringHashMap = std.hash_map.StringHashMap;
@@ -122,6 +122,13 @@ const IniFolder = struct {
     name: []const u8,
     files: ArrayList(IniFile),
     folders: ArrayList(IniFolder),
+};
+
+// A module space is a list of mappings, ClassName to PresetName-set.
+// As well as a module name, taken from the actual folder name.
+const ModuleSpace = struct {
+    entityDefinitions: *StringArrayHashMap(*StringArrayHashMap(void)),
+    moduleName: []const u8,
 };
 
 /// Updated by `convert()` to record what it is doing.
@@ -292,7 +299,10 @@ pub fn convert(input_folder_path_: []const u8, output_folder_path_: []const u8, 
 
     const ini_deinlining_rules = try parseIniDeinliningRules(rules_folder_path, allocator);
     std.log.info("Applying INI de-inlining rules...\n", .{});
-    try applyIniDeinliningRules(allocator, ini_deinlining_rules, &file_tree);
+    const entityDefinitionSets: *ArrayList(*ModuleSpace) = try allocator.create(ArrayList(*ModuleSpace));
+    entityDefinitionSets.* = ArrayList(*ModuleSpace).init(allocator);
+    try populateEntityDefinitionSets(allocator, &file_tree, entityDefinitionSets);
+    try applyIniDeinliningRules(allocator, ini_deinlining_rules, &file_tree, entityDefinitionSets);
 
     std.log.info("Updating INI file tree...\n", .{});
     try updateIniFileTree(&file_tree, allocator);
@@ -1399,15 +1409,80 @@ fn parseIniDeinliningRules(rules_folder_path: []const u8, allocator: Allocator) 
     return try parseFromSliceLeaky([][]const u8, allocator, text, .{});
 }
 
-fn applyIniDeinliningRules(allocator: Allocator, ini_deinlining_rules: [][]const u8, file_tree: *IniFolder) !void {
-    for (ini_deinlining_rules) |property| {
-        try applyIniDeinliningRulesRecursivelyFolder(allocator, file_tree, property);
+fn populateEntityDefinitionSets(allocator: Allocator, file_tree: *IniFolder, modules: *ArrayList(*ModuleSpace)) !void {
+    for (file_tree.folders.items) |*folder| {
+        const entityDefinitions: *StringArrayHashMap(*StringArrayHashMap(void)) = try allocator.create(StringArrayHashMap(*StringArrayHashMap(void)));
+        entityDefinitions.* = StringArrayHashMap(*StringArrayHashMap(void)).init(allocator);
+
+        try populateEntityDefinitionSetsRecursively(allocator, folder, entityDefinitions);
+
+        const module: *ModuleSpace = try allocator.create(ModuleSpace);
+        module.* = ModuleSpace{
+            .moduleName = folder.name,
+            .entityDefinitions = entityDefinitions,
+        };
+
+        try modules.append(module);
     }
 }
 
-fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *IniFolder, property: []const u8) !void {
+fn populateEntityDefinitionSetsRecursively(allocator: Allocator, moduleFolder: *IniFolder, entitySpace: *StringArrayHashMap(*StringArrayHashMap(void))) !void {
+    for (moduleFolder.folders.items) |*folder| {
+        try populateEntityDefinitionSetsRecursively(allocator, folder, entitySpace);
+    }
+
+    for (moduleFolder.files.items) |*file| {
+        for (file.ast.items) |*node| {
+            try populateEntityDefinitionSetsNode(allocator, node, entitySpace);
+        }
+    }
+}
+
+fn populateEntityDefinitionSetsNode(allocator: Allocator, serialNode: *Node, entitySpace: *StringArrayHashMap(*StringArrayHashMap(void))) !void {
+    // Assume this isn't an Entity with a PresetName.
+    var presetName: ?[]const u8 = null;
+
+    // Find out if it does specify a PresetName, and record it if so.
+    for (serialNode.children.items) |*node| {
+        if (node.property) |nodeProperty| {
+            if (strEql(nodeProperty, "PresetName")) {
+                if (node.value) |nodeValue| {
+                    presetName = nodeValue;
+                }
+            }
+        }
+    }
+
+    // If this has a specified PresetName, then this is an Entity from this module, which will be useful for accurate de-inlining.
+    if (presetName) |presetNameNonOptional| {
+        if (serialNode.value) |serialNodeValue| {
+            var presetSpace: *StringArrayHashMap(void) = entitySpace.get(serialNodeValue) orelse emplaceEntitySpace: {
+                const presetSpace: *StringArrayHashMap(void) = try allocator.create(StringArrayHashMap(void));
+                presetSpace.* = StringArrayHashMap(void).init(allocator);
+                try entitySpace.put(serialNodeValue, presetSpace);
+                break :emplaceEntitySpace presetSpace;
+            };
+
+            try presetSpace.put(presetNameNonOptional, {});
+        }
+    }
+
+    for (serialNode.children.items) |*node| {
+        try populateEntityDefinitionSetsNode(allocator, node, entitySpace);
+    }
+}
+
+fn applyIniDeinliningRules(allocator: Allocator, ini_deinlining_rules: [][]const u8, file_tree: *IniFolder, modules: *ArrayList(*ModuleSpace)) !void {
+    for (file_tree.folders.items, 0..) |*moduleFolder, moduleID| {
+        for (ini_deinlining_rules) |property| {
+            try applyIniDeinliningRulesRecursivelyFolder(allocator, moduleFolder, property, modules.items[moduleID]);
+        }
+    }
+}
+
+fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *IniFolder, property: []const u8, moduleSpace: *ModuleSpace) !void {
     for (file_tree.folders.items) |*folder| {
-        try applyIniDeinliningRulesRecursivelyFolder(allocator, folder, property);
+        try applyIniDeinliningRulesRecursivelyFolder(allocator, folder, property, moduleSpace);
     }
 
     for (file_tree.files.items) |*file| {
@@ -1421,7 +1496,7 @@ fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *In
             // Why necessary? Because some unused inis use the word "Particle" as a root property.
             for (node.children.items) |*child| {
                 // Deinlining a definition into the file will push the current object further forward.
-                const insertionApplied: bool = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, node.*);
+                const insertionApplied: bool = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, node.*, moduleSpace);
 
                 // We want to read the object again, since we stopped after the deinline, but we also want to read the definition that was deinlined.
                 // So decrement i.
@@ -1434,7 +1509,7 @@ fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *In
     }
 }
 
-fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, property: []const u8, file: *IniFile, rootParent: Node) !bool {
+fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, property: []const u8, file: *IniFile, rootParent: Node, moduleSpace: *ModuleSpace) !bool {
     // If this has a property, and:
     if (node.property) |node_property| {
         // If it matches the property given, and:
@@ -1472,7 +1547,10 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                 // Assume that nothing is invalidated.
                 var invalidationFlag = false;
                 if (presetNameOptional) |presetName| {
+                    // Special case Loadouts
                     if (!strEql(rootParent.property.?, "AddLoadout")) {
+                        moduleName = moduleSpace.moduleName;
+
                         const duplicateNode = Node{
                             .property = "AddEffect",
                             .value = node.value,
@@ -1484,10 +1562,22 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                         try file.ast.insert(determinedIndex, duplicateNode);
 
                         invalidationFlag = true;
+                    } else {
+                        if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
+                            if (presetNameSpace.get(presetName) != null) {
+                                moduleName = moduleSpace.moduleName;
+                            }
+                        }
                     }
 
                     node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, presetName });
                 } else if (copyOfNameOptional) |copyOfName| {
+                    if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
+                        if (presetNameSpace.get(copyOfName) != null) {
+                            moduleName = moduleSpace.moduleName;
+                        }
+                    }
+
                     node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, copyOfName });
                 } else {
                     node.value = "None";
@@ -1506,7 +1596,7 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
 
     // Since this isn't a malformed constant reference, check the same for this' children.
     for (node.children.items) |*child| {
-        const sequenceInvalidated = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, rootParent);
+        const sequenceInvalidated = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, rootParent, moduleSpace);
 
         // We have discovered an inline definition, and corrected it, which we must immediately signal to the caller.
         if (sequenceInvalidated) {
@@ -2480,8 +2570,8 @@ fn writeAstRecursively(node: *Node, buffered_writer: anytype, depth: usize) !voi
     }
 
     if (node.value) |value| {
-            try writeBuffered(buffered_writer, value);
-        }
+        try writeBuffered(buffered_writer, value);
+    }
 
     if (node.comments.items.len > 0) {
         if (node.property != null) {
