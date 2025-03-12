@@ -1516,7 +1516,7 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
             if (strEql(nodeProperty, property)) {
                 if (node.children.items.len > 0) {
                     const className: []const u8 = nodeValue;
-                    var moduleName: []const u8 = "Base.rte";
+                    var moduleNameOptional: ?[]const u8 = null;
                     var presetNameOptional: ?[]const u8 = null;
 
                     var isOriginalPreset: bool = false;
@@ -1542,7 +1542,7 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                     // This lets it respect when well written mods intentionally reference non-Base data entities.
                     if (presetNameOptional) |presetName| {
                         if (indexOf(u8, presetName, "/")) |modulePrefixEnd| {
-                            moduleName = presetName[0..modulePrefixEnd];
+                            moduleNameOptional = presetName[0..modulePrefixEnd];
                             presetNameOptional = presetName[modulePrefixEnd + 1 ..];
                         }
                     }
@@ -1554,7 +1554,7 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                     // If we're set to deinline, then we're making a new preset definition in this module.
                     // This means the constant reference should certainly point to this module.
                     if (deinliningFlag) {
-                        moduleName = moduleSpace.moduleName;
+                        moduleNameOptional = moduleSpace.moduleName;
 
                         const duplicateNode = Node{
                             .property = "AddEffect",
@@ -1571,13 +1571,16 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                     if (presetNameOptional) |presetName| {
                         // If this was copied from something, and it isn't an original preset,
                         // then check if it is pointing to something within this module.
-                        if (isCopyOf and !isOriginalPreset) {
-                            if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
-                                if (presetNameSpace.get(presetName) != null) {
-                                    moduleName = moduleSpace.moduleName;
+                        const moduleName: []const u8 = moduleNameOptional orelse moduleNameDeterminingBlock: {
+                            if (isCopyOf and !isOriginalPreset) {
+                                if (moduleSpace.entityDefinitions.get(className)) |presetNameSpace| {
+                                    if (presetNameSpace.get(presetName) != null) {
+                                        break :moduleNameDeterminingBlock moduleSpace.moduleName;
+                                    }
                                 }
                             }
-                        }
+                            break :moduleNameDeterminingBlock "Base.rte";
+                        };
 
                         node.value = try allocPrint(allocator, "{s}/{s}/{s}", .{ className, moduleName, presetName });
                     } else {
@@ -2620,6 +2623,10 @@ test "mod" {
 
 test "updated" {
     try testDirectory("updated", false);
+}
+
+test "constant_reference" {
+    try testDirectory("constant_reference", false);
 }
 
 fn testDirectory(comptime directory_name: []const u8, is_invalid_test: bool) !void {
