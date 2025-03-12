@@ -1494,6 +1494,7 @@ fn applyIniDeinliningRulesRecursivelyFolder(allocator: Allocator, file_tree: *In
 
             // Instead of looping over all nodes, loop over the children of each node.
             // Why necessary? Because some unused inis use the word "Particle" as a root property.
+            // This is safe, however, because there should never be any lone constant references at root property level.
             for (node.children.items) |*child| {
                 // Deinlining a definition into the file will push the current object further forward.
                 const insertionApplied: bool = try applyIniDeinliningRulesRecursivelyNode(allocator, child, property, file, node.*, moduleSpace);
@@ -1521,15 +1522,17 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                     var isOriginalPreset: bool = false;
                     var isCopyOf: bool = false;
 
-                    // If we read a CopyOf, then whatever preset name we were going with is invalidated.
+                    // A CopyOf changes what the constant reference will point to,
+                    // unless it is following a PresetName, which is assumed to be a mistake.
+                    // A PresetName always changes the pointing of the constant reference.
                     for (node.children.items) |*child| {
                         if (child.property) |childProperty| {
                             const readingCopyOf: bool = strEql(childProperty, "CopyOf");
                             const readingOriginalPreset: bool = strEql(childProperty, "PresetName");
                             isCopyOf = isCopyOf or readingCopyOf;
-                            isOriginalPreset = !readingCopyOf and (isOriginalPreset or readingOriginalPreset);
+                            isOriginalPreset = isOriginalPreset or readingOriginalPreset;
 
-                            if (readingCopyOf or readingOriginalPreset) {
+                            if ((readingCopyOf and !isOriginalPreset) or readingOriginalPreset) {
                                 presetNameOptional = child.value;
                             }
                         }
@@ -1548,6 +1551,8 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                     // then we're going to deinline it.
                     const deinliningFlag = isOriginalPreset and !strEql(rootParent.property.?, "AddLoadout");
 
+                    // If we're set to deinline, then we're making a new preset definition in this module.
+                    // This means the constant reference should certainly point to this module.
                     if (deinliningFlag) {
                         moduleName = moduleSpace.moduleName;
 
@@ -1562,6 +1567,7 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                         try file.ast.insert(determinedIndex, duplicateNode);
                     }
 
+                    // As long as we ever encountered the implication of a preset name, we can construct a constant reference.
                     if (presetNameOptional) |presetName| {
                         // If this was copied from something, and it isn't an original preset,
                         // then check if it is pointing to something within this module.
@@ -1581,6 +1587,8 @@ fn applyIniDeinliningRulesRecursivelyNode(allocator: Allocator, node: *Node, pro
                     node.children.clearRetainingCapacity();
                     node.comments.clearRetainingCapacity();
 
+                    // In any case, this was a malformed constant reference, and it no longer has children to correct.
+                    // We signal to the caller if a definition has been deinlined, so that it can step backwards to proofread that one as well.
                     return deinliningFlag;
                 }
             }
