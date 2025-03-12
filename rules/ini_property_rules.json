@@ -30,5 +30,6 @@
 	"CollidesWithTerrainWhenAttached": "CollidesWithTerrainWhileAttached",
 	"DrawWhenOpen": "DrawMaterialLayerWhenOpen",
 	"DrawWhenClosed": "DrawMaterialLayerWhenClosed",
-	"AffectedByPitch": "AffectedByGlobalPitch"
+	"AffectedByPitch": "AffectedByGlobalPitch",
+	"InstanceName": "PresetName"
 }
