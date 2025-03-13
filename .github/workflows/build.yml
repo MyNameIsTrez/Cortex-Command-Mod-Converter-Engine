@@ -1,0 +1,23 @@
+name: CI Build
+
+on: push
+
+jobs:
+  build-tests:
+    name: tests
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print curl version
+        run: curl --version
+
+      - name: Print wget version
+        run: wget --version
+
+      - name: Download Zig
+        run: wget https://ziglang.org/download/0.12.0/zig-windows-x86_64-0.12.0.zip
+
+      - name: Run the tests
+        run: zig test -freference-trace src/main.zig
